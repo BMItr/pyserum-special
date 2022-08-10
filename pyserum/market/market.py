@@ -9,20 +9,21 @@ from solana.rpc.api import Client
 from solana.rpc.types import RPCResponse, TxOpts
 from solana.transaction import Transaction
 
-import pyserum.market.types as t
 from pyserum import instructions
+import pyserum.market.types as t
 
 from .._layouts.open_orders import OPEN_ORDERS_LAYOUT
 from ..enums import OrderType, Side
 from ..open_orders_account import OpenOrdersAccount
 from ..utils import load_bytes_data
 from ._internal.queue import decode_event_queue, decode_request_queue
-from .core import MarketCore
 from .orderbook import OrderBook
 from .state import MarketState
+from .core import MarketCore
 
 LAMPORTS_PER_SOL = 1000000000
 
+import base64
 
 # pylint: disable=too-many-public-methods,abstract-method
 class Market(MarketCore):
@@ -54,6 +55,12 @@ class Market(MarketCore):
         return OpenOrdersAccount.find_for_market_and_owner(
             self._conn, self.state.public_key(), owner_address, self.state.program_id()
         )
+
+    def get_order_account_data(self, acc_address: PublicKey) -> List[OpenOrdersAccount]:
+        res = self._conn.get_account_info(acc_address, commitment='processed')
+        decodedBytes = base64.decodebytes(res['result']['value']["data"][0].encode("ascii"))
+        acc = OpenOrdersAccount.from_bytes(acc_address, decodedBytes)
+        return [acc]
 
     def load_bids(self) -> OrderBook:
         """Load the bid order book"""
@@ -127,6 +134,46 @@ class Market(MarketCore):
         )
         return self._conn.send_transaction(transaction, *signers, opts=opts)
 
+    def place_order_quick(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        payer: PublicKey,
+        owner: Keypair,
+        order_type: OrderType,
+        side: Side,
+        order_account: PublicKey,
+        limit_price: float,
+        max_quantity: float,
+        client_id: int = 0,
+        opts: TxOpts = TxOpts(),
+    ) -> RPCResponse:  # TODO: Add open_orders_address_key param and fee_discount_pubkey
+        transaction = Transaction()
+        signers: List[Keypair] = [owner]
+        open_order_accounts = self.get_order_account_data(order_account)
+        if open_order_accounts:
+            place_order_open_order_account = open_order_accounts[0].address
+        else:
+            mbfre_resp = self._conn.get_minimum_balance_for_rent_exemption(OPEN_ORDERS_LAYOUT.sizeof())
+            place_order_open_order_account = self._after_oo_mbfre_resp(
+                mbfre_resp=mbfre_resp, owner=owner, signers=signers, transaction=transaction
+            )
+            # TODO: Cache new_open_orders_account
+        # TODO: Handle fee_discount_pubkey
+
+        self._prepare_order_transaction(
+            transaction=transaction,
+            payer=payer,
+            owner=owner,
+            order_type=order_type,
+            side=side,
+            signers=signers,
+            limit_price=limit_price,
+            max_quantity=max_quantity,
+            client_id=client_id,
+            open_order_accounts=open_order_accounts,
+            place_order_open_order_account=place_order_open_order_account,
+        )
+        return self._conn.send_transaction(transaction, *signers, opts=opts)
+
     def cancel_order_by_client_id(
         self, owner: Keypair, open_orders_account: PublicKey, client_id: int, opts: TxOpts = TxOpts()
     ) -> RPCResponse:
@@ -166,4 +213,4 @@ class Market(MarketCore):
             min_bal_for_rent_exemption=min_bal_for_rent_exemption,
             should_wrap_sol=should_wrap_sol,
         )
-        return self._conn.send_transaction(transaction, *signers, opts=opts)
+        return self._conn.send_transaction(transaction, owner, opts=opts)
